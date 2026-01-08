@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "early_exit_llm"
+version = "0.1.0"
+description = "Early exit training and inference for LLMs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.35",
+    "accelerate",
+    "bitsandbytes",
+    "datasets",
+    "tqdm",
+    "numpy",
+]
+
+[project.optional-dependencies]
+train = ["wandb"]
+calibrate = ["scikit-learn"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
