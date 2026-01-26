@@ -118,8 +118,8 @@ def get_evaluation_data(
 
         samples.append(
             {
-                "input_ids": tokens["input_ids"],
-                "attention_mask": tokens["attention_mask"],
+                "input_ids": tokens["input_ids"][0],  # Remove batch dim [1, L] -> [L]
+                "attention_mask": tokens["attention_mask"][0],
             }
         )
 
@@ -132,31 +132,40 @@ def evaluate_head_accuracy(
     samples: List[Dict],
     model_config: ModelConfig,
     device: str = "cuda",
+    batch_size: int = 8,
 ) -> EvaluationResults:
     """
     Evaluate the accuracy of each head and the main lm_head.
-
-    For next-token prediction, we compare each head's predictions to the
-    main model's predictions (treating main model as ground truth).
+    Supports batched inference and vectorized metric calculation.
     """
+    from torch.utils.data import DataLoader
+    from transformers import default_data_collator
+
     num_heads = model_config.num_heads
     head_layer_indices = model_config.head_layer_indices
 
-    # Counters for main head
+    # Create DataLoader for batching
+    dataloader = DataLoader(
+        samples,
+        batch_size=batch_size,
+        collate_fn=default_data_collator,
+        shuffle=False,
+    )
+
+    # Counters
+    total_tokens = 0
     main_correct = 0
     main_top5_correct = 0
-    total_tokens = 0
 
-    # Counters per auxiliary head
-    head_correct = [0] * num_heads
-    head_top5_correct = [0] * num_heads
-    # Counters for accuracy vs lm_head (how often head matches main model)
-    head_matches_lm = [0] * num_heads
-    head_top5_matches_lm = [0] * num_heads
+    # Per-head counters
+    head_correct = torch.zeros(num_heads, device=device, dtype=torch.long)
+    head_top5_correct = torch.zeros(num_heads, device=device, dtype=torch.long)
+    head_matches_lm = torch.zeros(num_heads, device=device, dtype=torch.long)
+    head_top5_matches_lm = torch.zeros(num_heads, device=device, dtype=torch.long)
 
-    for sample in tqdm(samples, desc="Evaluating"):
-        input_ids = sample["input_ids"].to(device)
-        attention_mask = sample["attention_mask"].to(device)
+    for batch in tqdm(dataloader, desc="Evaluating"):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
 
         with torch.no_grad():
             main_logits, head_logits_list, _ = model(
@@ -164,57 +173,61 @@ def evaluate_head_accuracy(
                 attention_mask=attention_mask,
             )
 
-        # Create labels by shifting input_ids by 1 (next token prediction)
-        # Label at position t is the token at position t+1
-        labels = input_ids[:, 1:].clone()
+        # Labels are next tokens (shift input_ids by 1)
+        labels = input_ids[:, 1:]  # [B, L-1]
+        valid_mask = attention_mask[:, 1:] == 1  # [B, L-1]
+        num_valid_tokens = valid_mask.sum().item()
+        total_tokens += num_valid_tokens
 
-        # Predictions are made at positions 0 to seq_len-2 to predict position 1 to seq_len-1
-        main_logits_shifted = main_logits[:, :-1, :]
+        # --- Main Model Evaluation ---
+        # Shift logits: predict token t+1 from hidden state at t
+        main_logits_shifted = main_logits[:, :-1, :]  # [B, L-1, V]
+        
+        # Top-1
+        main_preds = torch.argmax(main_logits_shifted, dim=-1)  # [B, L-1]
+        main_correct_mask = (main_preds == labels) & valid_mask
+        main_correct += main_correct_mask.sum().item()
 
-        # Main model predictions and accuracy
-        main_preds = torch.argmax(main_logits_shifted, dim=-1)
-        main_top5_preds = torch.topk(main_logits_shifted, k=5, dim=-1).indices
+        # Top-5
+        # labels.unsqueeze(-1) -> [B, L-1, 1]
+        # topk.indices -> [B, L-1, 5]
+        main_top5 = torch.topk(main_logits_shifted, k=5, dim=-1).indices
+        main_top5_mask = (main_top5 == labels.unsqueeze(-1)).any(dim=-1) & valid_mask
+        main_top5_correct += main_top5_mask.sum().item()
 
-        # Get valid positions (where attention mask is 1 and we have a label)
-        valid_mask = attention_mask[:, 1:] == 1
+        # --- Aux Heads Evaluation ---
+        for head_idx, head_logits in enumerate(head_logits_list):
+            head_logits_shifted = head_logits[:, :-1, :]  # [B, L-1, V]
+            
+            # Head Predictions
+            head_preds = torch.argmax(head_logits_shifted, dim=-1)  # [B, L-1]
+            head_top5 = torch.topk(head_logits_shifted, k=5, dim=-1).indices
 
-        batch_size, seq_len = labels.shape
+            # 1. Accuracy vs Ground Truth
+            head_correct_mask = (head_preds == labels) & valid_mask
+            head_correct[head_idx] += head_correct_mask.sum()
 
-        for b in range(batch_size):
-            for t in range(seq_len):
-                if not valid_mask[b, t]:
-                    continue
+            head_top5_mask = (head_top5 == labels.unsqueeze(-1)).any(dim=-1) & valid_mask
+            head_top5_correct[head_idx] += head_top5_mask.sum()
 
-                total_tokens += 1
-                label = labels[b, t].item()
-                main_pred = main_preds[b, t].item()
-                main_top5 = main_top5_preds[b, t].tolist()
+            # 2. Accuracy vs Main Model (Fidelity)
+            # Matches if head prediction == main model prediction
+            match_mask = (head_preds == main_preds) & valid_mask
+            head_matches_lm[head_idx] += match_mask.sum()
 
-                # Main head accuracy
-                if main_pred == label:
-                    main_correct += 1
-                if label in main_top5:
-                    main_top5_correct += 1
+            # Top-5 Match: Does main model's pred appear in head's top 5?
+            # Or: Does head's pred appear in main model's top 5? 
+            # Original code: "if main_pred in head_top5"
+            match_top5_mask = (head_top5 == main_preds.unsqueeze(-1)).any(dim=-1) & valid_mask
+            head_top5_matches_lm[head_idx] += match_top5_mask.sum()
 
-                # Auxiliary head accuracy
-                for head_idx in range(num_heads):
-                    head_logits = head_logits_list[head_idx][:, :-1, :]
-                    head_pred = torch.argmax(head_logits[b, t, :]).item()
-                    head_top5 = torch.topk(head_logits[b, t, :], k=5).indices.tolist()
+    # Move metrics to CPU
+    head_correct = head_correct.cpu().numpy()
+    head_top5_correct = head_top5_correct.cpu().numpy()
+    head_matches_lm = head_matches_lm.cpu().numpy()
+    head_top5_matches_lm = head_top5_matches_lm.cpu().numpy()
 
-                    # Accuracy vs ground truth (next token)
-                    if head_pred == label:
-                        head_correct[head_idx] += 1
-                    if label in head_top5:
-                        head_top5_correct[head_idx] += 1
-
-                    # Accuracy vs lm_head (how often head matches main model)
-                    if head_pred == main_pred:
-                        head_matches_lm[head_idx] += 1
-                    if main_pred in head_top5:
-                        head_top5_matches_lm[head_idx] += 1
-
-    # Compute accuracies
+    # Compute Accuracies
     main_accuracy = main_correct / total_tokens if total_tokens > 0 else 0.0
     main_top5_accuracy = main_top5_correct / total_tokens if total_tokens > 0 else 0.0
 
@@ -234,12 +247,12 @@ def evaluate_head_accuracy(
         result = HeadAccuracyResult(
             head_idx=head_idx,
             layer_idx=head_layer_indices[head_idx],
-            correct=head_correct[head_idx],
+            correct=int(head_correct[head_idx]),
             total=total_tokens,
-            accuracy=accuracy,
-            top5_accuracy=top5_accuracy,
-            accuracy_vs_lm_head=accuracy_vs_lm,
-            top5_accuracy_vs_lm_head=top5_acc_vs_lm,
+            accuracy=float(accuracy),
+            top5_accuracy=float(top5_accuracy),
+            accuracy_vs_lm_head=float(accuracy_vs_lm),
+            top5_accuracy_vs_lm_head=float(top5_acc_vs_lm),
         )
         head_results.append(result)
 
@@ -383,6 +396,12 @@ def main():
         default="cuda",
         help="Device to use",
     )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Batch size for evaluation",
+    )
     args = parser.parse_args()
 
     # Load model
@@ -410,6 +429,7 @@ def main():
         samples=samples,
         model_config=model_config,
         device=args.device,
+        batch_size=args.batch_size,
     )
 
     # Print results
