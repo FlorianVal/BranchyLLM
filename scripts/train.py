@@ -74,41 +74,12 @@ class ModelWithAuxiliaryHeads(nn.Module):
         super().__init__()
         self.model_name = model_name
         self.num_heads = num_heads
+        self.quantization = quantization
+        self.device_map = device_map
+        self.model = None
+        self.config = None
 
-        # Quantization config
-        quantization_config = None
-        if quantization == "4bit":
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16
-                if torch.cuda.is_bf16_supported()
-                else torch.float32,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-        elif quantization == "8bit":
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-            )
-
-        # Load main model
-        self.config = AutoConfig.from_pretrained(model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            config=self.config,
-            quantization_config=quantization_config,
-            torch_dtype=torch.bfloat16
-            if torch.cuda.is_bf16_supported()
-            else torch.float32,
-            # We trust accelerate to handle device placement if no quantization,
-            # but for quantization we might need to rely on HF accelerate integration or device_map="auto"??
-            # Actually, standard accelerate launch handles this.
-        )
-
-        # Freeze main model
-        self.model.eval()
-        for param in self.model.parameters():
-            param.requires_grad = False
+        self._load_model()
 
         self.aux_heads = nn.ModuleList()
         self.head_layer_indices = self._calculate_head_layer_indices()
@@ -117,6 +88,68 @@ class ModelWithAuxiliaryHeads(nn.Module):
 
         self._initialize_heads()
         self._register_hooks()
+
+    def _build_quantization_config(self) -> Optional[BitsAndBytesConfig]:
+        if self.quantization == "4bit":
+            return BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float32,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+        if self.quantization == "8bit":
+            return BitsAndBytesConfig(
+                load_in_8bit=True,
+            )
+        return None
+
+    def _load_model(self) -> None:
+        if self.model is not None:
+            return
+
+        quantization_config = self._build_quantization_config()
+        self.config = AutoConfig.from_pretrained(self.model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            config=self.config,
+            quantization_config=quantization_config,
+            torch_dtype=torch.bfloat16
+            if torch.cuda.is_bf16_supported()
+            else torch.float32,
+        )
+
+        self.model.eval()
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def load_backbone(self) -> None:
+        if self.model is not None:
+            return
+
+        logger.info("Loading backbone model...")
+        self._load_model()
+        self._register_hooks()
+
+    def unload_backbone(self) -> None:
+        if self.model is None:
+            return
+
+        logger.info("Unloading backbone model to free memory...")
+        for h in self.hook_handles:
+            h.remove()
+        self.hook_handles = []
+
+        del self.model
+        self.model = None
+        self.intermediate_activations = {}
+
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _calculate_head_layer_indices(self) -> List[int]:
         """
@@ -133,41 +166,27 @@ class ModelWithAuxiliaryHeads(nn.Module):
 
     def _initialize_heads(self):
         """
-        Initialize auxiliary heads to mimic the main model's head structure.
-        Llama 3 has a Model.norm (RMSNorm) before the lm_head.
+        Initialize auxiliary heads.
         """
-        hidden_size = self.config.hidden_size
+        self.aux_heads = nn.ModuleList()
         vocab_size = self.config.vocab_size
+        hidden_size = self.config.hidden_size
 
-        for _ in range(self.num_heads):
-            # Create a copy of the normalization layer logic
-            # We instantiate new metrics, we don't share the main model's norm parameters
-            # because the statistics at intermediate layers might be different,
-            # but we want the same architecture (RMSNorm).
-            # We can copy the class from the main model.
+        # Try to find norm layer
+        norm_layer = None
+        if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
+            norm_layer = self.model.model.norm
+        elif hasattr(self.model, "transformer") and hasattr(
+            self.model.transformer, "ln_f"
+        ):
+            norm_layer = self.model.transformer.ln_f
 
-            # Llama model usually has `model.norm`
-            if hasattr(self.model, "model") and hasattr(self.model.model, "norm"):
-                original_norm = self.model.model.norm
-                # Deepcopy or re-instantiate similar norm
-                import copy
-
-                norm_layer = copy.deepcopy(original_norm)
-            elif hasattr(self.model, "transformer") and hasattr(
-                self.model.transformer, "ln_f"
-            ):
-                # GPT-2
-                original_norm = self.model.transformer.ln_f
-                import copy
-
-                norm_layer = copy.deepcopy(original_norm)
-            else:
-                norm_layer = None
-                logger.warning(
-                    "Could not find normalization layer in model. Using Identity."
-                )
-
-            head = AuxiliaryHead(hidden_size, vocab_size, norm_layer)
+        for idx in self.head_layer_indices:
+            # Create a new head
+            # Note: We should ideally copy the norm layer if it's layer-specific,
+            # but usually it's the same for all layers in Llama.
+            # We also need to ensure the head is on the correct device/dtype.
+            head = AuxiliaryHead(hidden_size, vocab_size, norm_layer=norm_layer)
             # Cast head to model dtype
             head.to(self.model.dtype)
             self.aux_heads.append(head)
@@ -264,6 +283,9 @@ def get_dataloaders(
     tokenizer: AutoTokenizer,
     batch_size: int,
     max_length: int = 512,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    prefetch_factor: Optional[int] = None,
 ):
     """
     Load and process dataset.
@@ -304,7 +326,13 @@ def get_dataloaders(
         tokenize_function, batched=True, remove_columns=["text"]
     )
     train_dataloader = DataLoader(
-        train_tokenized_dataset, batch_size=batch_size, collate_fn=default_data_collator
+        train_tokenized_dataset,
+        batch_size=batch_size,
+        collate_fn=default_data_collator,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )
 
     # Eval
@@ -317,22 +345,60 @@ def get_dataloaders(
             eval_tokenized_dataset,
             batch_size=batch_size,
             collate_fn=default_data_collator,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
         )
 
     return train_dataloader, eval_dataloader
 
 
-def compute_kl_loss(student_logits, teacher_logits):
+def compute_kl_loss(student_logits, teacher_logits, top_k=0):
     """
-    KL Divergence Loss.
-    """
-    # Softmax on both
-    temp = 1.0
-    teacher_probs = F.softmax(teacher_logits / temp, dim=-1)
-    student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
+    KL Divergence Loss with optional top-k optimization.
 
-    # KLDivLoss: input should be log-probs, target should be probs
-    loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+    Args:
+        student_logits: (batch, seq_len, vocab_size)
+        teacher_logits: (batch, seq_len, vocab_size)
+        top_k: If > 0, only compute KL on top-K teacher tokens (much faster for large vocabs)
+
+    Returns:
+        KL loss scalar
+    """
+    temp = 1.0
+
+    if top_k > 0:
+        # Top-K optimization: only consider top-K tokens from teacher
+        # This significantly reduces computation when vocab_size is large (e.g., 128K)
+        k = min(top_k, teacher_logits.size(-1))
+        top_k_values, top_k_indices = torch.topk(teacher_logits, k, dim=-1)
+
+        # Softmax only on the top-K values
+        teacher_probs_top_k = F.softmax(top_k_values / temp, dim=-1)
+
+        # Gather student logits for only top-K positions
+        batch_size, seq_len, vocab_size = student_logits.shape
+        batch_indices = torch.arange(batch_size, device=student_logits.device).view(
+            -1, 1, 1
+        )
+        seq_indices = torch.arange(seq_len, device=student_logits.device).view(1, -1, 1)
+
+        student_logits_top_k = student_logits[batch_indices, seq_indices, top_k_indices]
+
+        # Log-softmax on student top-K
+        student_log_probs_top_k = F.log_softmax(student_logits_top_k / temp, dim=-1)
+
+        # KLDivLoss: input should be log-probs, target should be probs
+        loss = F.kl_div(
+            student_log_probs_top_k, teacher_probs_top_k, reduction="batchmean"
+        )
+    else:
+        # Full vocabulary KL loss
+        teacher_probs = F.softmax(teacher_logits / temp, dim=-1)
+        student_log_probs = F.log_softmax(student_logits / temp, dim=-1)
+        loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+
     return loss
 
 
@@ -345,9 +411,16 @@ def compute_accuracy(student_logits, teacher_logits):
     return (student_preds == teacher_preds).float().mean()
 
 
-def evaluate(model_wrapper, eval_dataloader, accelerator, num_steps=100):
+def evaluate(model_wrapper, eval_dataloader, accelerator, num_steps=100, top_k_kl=0):
     """
     Run evaluation on the validation dataset.
+
+    Args:
+        model_wrapper: Model with auxiliary heads
+        eval_dataloader: Evaluation dataloader
+        accelerator: Accelerate instance
+        num_steps: Number of evaluation steps
+        top_k_kl: Top-K for KL loss optimization
     """
     model_wrapper.eval()
     losses = []
@@ -376,16 +449,11 @@ def evaluate(model_wrapper, eval_dataloader, accelerator, num_steps=100):
             batch_acc = 0.0
 
             for i, head_logits in enumerate(head_logits_list):
-                loss = compute_kl_loss(head_logits, teacher_logits)
+                loss = compute_kl_loss(head_logits, teacher_logits, top_k=top_k_kl)
                 acc = compute_accuracy(head_logits, teacher_logits)
 
                 batch_loss += loss.item()
                 batch_acc += acc.item()
-
-                # We can track per-head accuracy, but for simplicity let's track mean accuracy
-                # or maybe just log everything at end?
-                # Let's just store the mean accuracy for now for simple metric
-                # If we want detailed, we'd need a list of list
 
             batch_loss /= len(head_logits_list)
             batch_acc /= len(head_logits_list)
@@ -412,6 +480,7 @@ def train_from_cache(
     args,
     eval_dataloader=None,
     model_wrapper=None,  # Needed for evaluation
+    global_step_offset=0,
 ):
     """Train auxiliary heads from cached hidden states.
 
@@ -429,13 +498,19 @@ def train_from_cache(
         cache_dataset,
         batch_size=1,  # Each cached item is already a batch
         shuffle=True,  # Can shuffle since we're training from cache
-        num_workers=0,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=args.num_workers > 0,
     )
 
     # Prepare with accelerator
     aux_heads, optimizer, cache_dataloader = accelerator.prepare(
         aux_heads, optimizer, cache_dataloader
     )
+
+    # Unwrap aux_heads for iteration and optimization
+    unwrapped_aux_heads = accelerator.unwrap_model(aux_heads)
 
     aux_heads.train()
 
@@ -456,20 +531,29 @@ def train_from_cache(
                 # Get teacher logits (squeeze batch dim since we use batch_size=1 in dataloader)
                 teacher_logits = batch["teacher_logits"].squeeze(0)
 
-                # Compute loss for each head
+                # Parallelize forward passes through all heads
+                # Stack all hidden states to process them in parallel (conceptually)
+                hidden_states_list = [
+                    batch[f"hidden_states_{layer_idx}"].squeeze(0)
+                    for layer_idx in layer_indices
+                ]
+
+                # Forward through all heads
+                head_logits_list = []
+                for head_module, hidden_states in zip(
+                    unwrapped_aux_heads, hidden_states_list
+                ):
+                    head_logits_list.append(head_module(hidden_states))
+
+                # Compute loss and metrics for each head
                 total_loss = 0.0
                 metrics = {}
 
-                for head_idx, (layer_idx, head_module) in enumerate(
-                    zip(layer_indices, aux_heads)
-                ):
-                    hidden_states = batch[f"hidden_states_{layer_idx}"].squeeze(0)
-
-                    # Forward through head
-                    head_logits = head_module(hidden_states)
-
-                    # Compute KL loss
-                    loss = compute_kl_loss(head_logits, teacher_logits)
+                for head_idx, head_logits in enumerate(head_logits_list):
+                    # Compute KL loss with optional top-k optimization
+                    loss = compute_kl_loss(
+                        head_logits, teacher_logits, top_k=args.top_k_kl
+                    )
                     acc = compute_accuracy(head_logits, teacher_logits)
 
                     total_loss += loss
@@ -477,7 +561,7 @@ def train_from_cache(
                     metrics[f"head_{head_idx}_accuracy"] = acc.item()
 
                 # Mean loss
-                total_loss = total_loss / len(aux_heads)
+                total_loss = total_loss / len(unwrapped_aux_heads)
                 metrics["train_loss"] = total_loss.item()
 
                 # Accumulate metrics
@@ -498,16 +582,17 @@ def train_from_cache(
 
                     progress_bar.update(1)
                     completed_steps += 1
+                    current_global_step = global_step_offset + completed_steps
                     lr_scheduler.step()
 
                     if accelerator.is_local_main_process:
                         current_lr = lr_scheduler.get_last_lr()[0]
                         avg_metrics["lr"] = current_lr
-                        accelerator.log(avg_metrics, step=completed_steps)
+                        accelerator.log(avg_metrics, step=current_global_step)
 
-                        if completed_steps % 50 == 0:
+                        if current_global_step % 50 == 0:
                             logger.info(
-                                f"Step {completed_steps} - Train Loss: {avg_metrics['train_loss']:.4f}"
+                                f"Step {current_global_step} - Train Loss: {avg_metrics['train_loss']:.4f}"
                             )
 
                         progress_bar.set_postfix(
@@ -521,37 +606,41 @@ def train_from_cache(
 
                     # Evaluation
                     if (
-                        completed_steps % args.eval_steps == 0
+                        current_global_step % args.eval_steps == 0
                         and eval_dataloader is not None
                         and model_wrapper is not None
                     ):
+                        model_wrapper.load_backbone()
+                        model_wrapper.to(accelerator.device)
                         eval_metrics = evaluate(
                             model_wrapper,
                             eval_dataloader,
                             accelerator,
                             num_steps=args.eval_max_steps,
+                            top_k_kl=args.top_k_kl,
                         )
                         if accelerator.is_local_main_process:
-                            accelerator.log(eval_metrics, step=completed_steps)
+                            accelerator.log(eval_metrics, step=current_global_step)
                             logger.info(
-                                f"Step {completed_steps} - Eval Loss: {eval_metrics['eval_loss']:.4f}"
+                                f"Step {current_global_step} - Eval Loss: {eval_metrics['eval_loss']:.4f}"
                             )
 
                             if eval_metrics["eval_loss"] < best_eval_loss:
                                 best_eval_loss = eval_metrics["eval_loss"]
                                 torch.save(
-                                    aux_heads.state_dict(),
+                                    unwrapped_aux_heads.state_dict(),
                                     os.path.join(args.output_dir, "best_aux_heads.pt"),
                                 )
+                        model_wrapper.unload_backbone()
 
                     # Checkpointing
-                    if completed_steps % args.save_steps == 0:
+                    if current_global_step % args.save_steps == 0:
                         if accelerator.is_local_main_process:
                             torch.save(
-                                aux_heads.state_dict(),
+                                unwrapped_aux_heads.state_dict(),
                                 os.path.join(
                                     args.output_dir,
-                                    f"aux_heads_step_{completed_steps}.pt",
+                                    f"aux_heads_step_{current_global_step}.pt",
                                 ),
                             )
 
@@ -662,6 +751,31 @@ def main():
         default=0,
         help="Number of steps for the warmup phase.",
     )
+    # DataLoader optimization arguments
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Number of DataLoader workers. Use 0 for single-process loading (safer for large batches). Default: 1",
+    )
+    parser.add_argument(
+        "--pin_memory",
+        type=lambda x: x.lower() in ["true", "1", "yes"],
+        default=True,
+        help="Pin memory for faster GPU transfer. Default: True",
+    )
+    parser.add_argument(
+        "--prefetch_factor",
+        type=int,
+        default=2,
+        help="Number of batches to prefetch per worker. Default: 2",
+    )
+    parser.add_argument(
+        "--top_k_kl",
+        type=int,
+        default=0,
+        help="Top-K for KL loss computation. If > 0, only compute KL on top-K teacher tokens. 0 = full vocab. Default: 0 (full vocab)",
+    )
     # Offline mode arguments
     parser.add_argument(
         "--mode",
@@ -682,7 +796,37 @@ def main():
         default=None,
         help="Number of steps to cache in offline mode (default: same as max_steps)",
     )
+    parser.add_argument(
+        "--num_epochs",
+        type=int,
+        default=1,
+        help="Number of epochs to train (for offline mode)",
+    )
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=None,
+        help="Number of steps to process in a single chunk (extract -> train loop) to save disk space. If None, processes all at once.",
+    )
+    parser.add_argument(
+        "--cache_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for hidden state extraction in offline mode (default: same as batch_size)",
+    )
+    parser.add_argument(
+        "--train_batch_size",
+        type=int,
+        default=None,
+        help="Batch size for training heads from cache in offline mode (default: same as batch_size)",
+    )
     args = parser.parse_args()
+
+    # Set default batch sizes for offline mode
+    if args.cache_batch_size is None:
+        args.cache_batch_size = args.batch_size
+    if args.train_batch_size is None:
+        args.train_batch_size = args.batch_size
 
     if args.run_name is None:
         model_basename = args.model_name.split("/")[-1]
@@ -720,6 +864,10 @@ def main():
         args.model_name, args.num_heads, args.quantization
     )
 
+    # Save config immediately so we have it for evaluation even if training crashes/runs
+    if accelerator.is_local_main_process:
+        _save_config(args, model_wrapper)
+
     # Optimizer
     # Use bnb 8-bit optimizer if quantization is enabled to save memory
     if args.quantization != "none":
@@ -755,6 +903,9 @@ def main():
         tokenizer,
         args.batch_size,
         args.max_length,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_memory,
+        prefetch_factor=args.prefetch_factor,
     )
 
     # =========================================================================
@@ -765,72 +916,164 @@ def main():
         logger.info("Running in OFFLINE mode")
 
         # Determine cache steps
-        cache_steps = (
+        total_cache_steps = (
             args.cache_steps if args.cache_steps is not None else args.max_steps
         )
 
-        # Create cache metadata for validation
-        cache_metadata = CacheMetadata(
-            model_name=args.model_name,
-            dataset_name=args.dataset_name,
-            dataset_config=args.dataset_config_name,
-            sample_start=0,
-            sample_end=cache_steps,
-            layer_indices=model_wrapper.head_layer_indices,
-            hidden_size=model_wrapper.config.hidden_size,
-            max_length=args.max_length,
-            config_hash=compute_config_hash(
-                args.model_name, model_wrapper.head_layer_indices
-            ),
-        )
+        # Save these before accelerator.prepare() wraps the model in DDP
+        head_layer_indices = model_wrapper.head_layer_indices
+        model_config = model_wrapper.config
+        aux_heads_ref = model_wrapper.aux_heads
 
-        # Check if cache exists and is valid
-        cache = HiddenStateCache(args.cache_dir)
-        is_valid, reason = cache.is_valid_for(cache_metadata)
+        # Check if we are using batched/chunked execution
+        if args.chunk_size is not None and args.chunk_size > 0:
+            logger.info(f"Using CHUNKED execution with chunk_size={args.chunk_size}")
 
-        if is_valid:
-            logger.info(f"Found valid cache at {args.cache_dir}")
+            # Prepare dataloader
+            train_dataloader = accelerator.prepare(train_dataloader)
+            if eval_dataloader is not None:
+                eval_dataloader = accelerator.prepare(eval_dataloader)
+
+            # Persistent iterator for extraction
+            extraction_iter = iter(train_dataloader)
+            total_trained_steps = 0
+
+            while total_trained_steps < args.max_steps:
+                logger.info(
+                    f"--- Chunk Loop: {total_trained_steps}/{args.max_steps} steps ---"
+                )
+                current_chunk_train_steps = min(
+                    args.chunk_size, args.max_steps - total_trained_steps
+                )
+
+                # Extraction batches needed
+                samples_needed = (
+                    current_chunk_train_steps
+                    * args.train_batch_size
+                    * args.gradient_accumulation_steps
+                    * accelerator.num_processes
+                )
+                extraction_batches_needed = (
+                    samples_needed + args.cache_batch_size - 1
+                ) // args.cache_batch_size
+
+                # Cache metadata
+                cache_metadata = CacheMetadata(
+                    model_name=args.model_name,
+                    dataset_name=args.dataset_name,
+                    dataset_config=args.dataset_config_name,
+                    sample_start=total_trained_steps
+                    * args.train_batch_size
+                    * args.gradient_accumulation_steps
+                    * accelerator.num_processes,
+                    sample_end=None,
+                    layer_indices=head_layer_indices,
+                    hidden_size=model_config.hidden_size,
+                    max_length=args.max_length,
+                    batch_size=args.cache_batch_size,
+                    config_hash=compute_config_hash(
+                        args.model_name, head_layer_indices
+                    ),
+                )
+
+                # Extract
+                model_wrapper.load_backbone()
+                if model_wrapper.model is not None:
+                    model_wrapper.model.to(accelerator.device)
+                extract_hidden_states(
+                    model_wrapper=model_wrapper,
+                    dataloader=train_dataloader,
+                    cache_dir=args.cache_dir,
+                    num_steps=extraction_batches_needed,
+                    layer_indices=head_layer_indices,
+                    metadata=cache_metadata,
+                    accelerator=accelerator,
+                    data_iter=extraction_iter,
+                )
+                model_wrapper.unload_backbone()
+
+                # Train
+                train_from_cache(
+                    aux_heads=aux_heads_ref,
+                    cache_dir=args.cache_dir,
+                    layer_indices=head_layer_indices,
+                    max_steps=current_chunk_train_steps,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    accelerator=accelerator,
+                    args=args,
+                    eval_dataloader=None,  # Disable internal eval
+                    model_wrapper=model_wrapper,
+                    global_step_offset=total_trained_steps,
+                )
+                total_trained_steps += current_chunk_train_steps
+
+                # Optional: Eval (requires reloading backbone)
+                if eval_dataloader is not None and (
+                    total_trained_steps % args.eval_steps < args.chunk_size
+                ):
+                    logger.info("Reloading backbone for evaluation...")
+                    model_wrapper.load_backbone()
+                    model_wrapper.to(accelerator.device)
+                    eval_metrics = evaluate(
+                        model_wrapper,
+                        eval_dataloader,
+                        accelerator,
+                        num_steps=args.eval_max_steps,
+                        top_k_kl=args.top_k_kl,
+                    )
+                    if accelerator.is_local_main_process:
+                        accelerator.log(eval_metrics, step=total_trained_steps)
+                        logger.info(f"Chunk Eval Loss: {eval_metrics['eval_loss']:.4f}")
+                    model_wrapper.unload_backbone()
         else:
-            logger.info(f"Cache invalid or missing: {reason}")
-            logger.info(f"Extracting {cache_steps} batches of hidden states...")
-
-            # Prepare for extraction (need model on device)
-            model_wrapper, train_dataloader = accelerator.prepare(
-                model_wrapper, train_dataloader
+            # ORIGINAL NON-CHUNKED LOGIC
+            cache_metadata = CacheMetadata(
+                model_name=args.model_name,
+                dataset_name=args.dataset_name,
+                dataset_config=args.dataset_config_name,
+                sample_start=0,
+                sample_end=total_cache_steps,
+                layer_indices=head_layer_indices,
+                hidden_size=model_config.hidden_size,
+                max_length=args.max_length,
+                batch_size=args.cache_batch_size,
+                config_hash=compute_config_hash(args.model_name, head_layer_indices),
             )
 
-            # Extract hidden states
-            extract_hidden_states(
-                model_wrapper=model_wrapper,
-                dataloader=train_dataloader,
-                cache_dir=args.cache_dir,
-                num_steps=cache_steps,
-                layer_indices=model_wrapper.head_layer_indices,
-                metadata=cache_metadata,
-                accelerator=accelerator,
-            )
+            # Check if cache exists and is valid
+            cache = HiddenStateCache(args.cache_dir)
+            is_valid, reason = cache.is_valid_for(cache_metadata)
 
-            logger.info("Cache extraction complete!")
+            if not is_valid:
+                logger.info(f"Cache invalid or missing: {reason}")
+                model_wrapper.load_backbone()
+                if model_wrapper.model is not None:
+                    model_wrapper.model.to(accelerator.device)
+                extract_hidden_states(
+                    model_wrapper=model_wrapper,
+                    dataloader=train_dataloader,
+                    cache_dir=args.cache_dir,
+                    num_steps=total_cache_steps,
+                    layer_indices=head_layer_indices,
+                    metadata=cache_metadata,
+                    accelerator=accelerator,
+                )
+                model_wrapper.unload_backbone()
 
-        # Phase 2: Train from cache
-        if args.max_steps > 0:
-            logger.info(f"Training heads from cache for {args.max_steps} steps...")
-
-            # Train from cached hidden states
-            train_from_cache(
-                aux_heads=model_wrapper.aux_heads,
-                cache_dir=args.cache_dir,
-                layer_indices=model_wrapper.head_layer_indices,
-                max_steps=args.max_steps,
-                optimizer=optimizer,
-                lr_scheduler=lr_scheduler,
-                accelerator=accelerator,
-                args=args,
-                eval_dataloader=eval_dataloader,
-                model_wrapper=model_wrapper,
-            )
-        else:
-            logger.info("max_steps=0, skipping training (extraction only)")
+            if args.max_steps > 0:
+                train_from_cache(
+                    aux_heads=aux_heads_ref,
+                    cache_dir=args.cache_dir,
+                    layer_indices=head_layer_indices,
+                    max_steps=args.max_steps,
+                    optimizer=optimizer,
+                    lr_scheduler=lr_scheduler,
+                    accelerator=accelerator,
+                    args=args,
+                    eval_dataloader=eval_dataloader,
+                    model_wrapper=model_wrapper,
+                )
 
         # Save final model
         accelerator.end_training()
@@ -899,7 +1142,7 @@ def main():
             metrics = {}
 
             for i, head_logits in enumerate(head_logits_list):
-                loss = compute_kl_loss(head_logits, teacher_logits)
+                loss = compute_kl_loss(head_logits, teacher_logits, top_k=args.top_k_kl)
                 acc = compute_accuracy(head_logits, teacher_logits)
 
                 # Add to total loss (sum first, then divide later for mean)
@@ -976,6 +1219,7 @@ def main():
                             eval_dataloader,
                             accelerator,
                             num_steps=args.eval_max_steps,
+                            top_k_kl=args.top_k_kl,
                         )
                         if accelerator.is_local_main_process:
                             accelerator.log(eval_metrics, step=completed_steps)
